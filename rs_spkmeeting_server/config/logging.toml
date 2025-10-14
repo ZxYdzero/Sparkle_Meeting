@@ -1,0 +1,25 @@
+level = "info"
+format = "pretty"
+
+[console]
+enabled = true
+colored = true
+
+[file]
+enabled = true
+path = "logs/spkmeeting.log"
+max_size = "10MB"
+max_files = 5
+append = true
+
+[rotation]
+daily = true
+hourly = false
+
+[filters]
+exclude_paths = [
+    "/health",
+    "/metrics",
+]
+log_request_body = false
+log_response_body = false
