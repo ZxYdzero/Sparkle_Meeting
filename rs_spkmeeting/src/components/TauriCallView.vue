@@ -11,6 +11,10 @@
       <button @click="toggleScreenShare" :disabled="!joined">
         {{ isScreenSharing ? '🖥️ 停止共享' : '🖥️ 共享屏幕' }}
       </button>
+      <div v-if="joined" class="volume-control">
+        <label>🔊 音量: <input type="range" v-model="globalVolume" min="0" max="100" @input="updateGlobalVolume"></label>
+        <span>{{ globalVolume }}%</span>
+      </div>
       <button @click="requestMediaPermissions" class="permissions-btn" title="请求媒体设备权限" :disabled="joined">
         🎤 请求权限
       </button>
@@ -115,6 +119,7 @@ const screenCaptureStatus = ref('');
 const audioEnabled = ref(true);
 const videoEnabled = ref(true);
 const isScreenSharing = ref(false);
+const globalVolume = ref(50); // 全局音量控制，默认50%
 
 const localVideo = ref<HTMLVideoElement | null>(null);
 
@@ -599,74 +604,77 @@ async function handleSignalRaw(text: string) {
     } else {
       console.log('👋 其他用户离开房间:', leavingUserId);
 
-      // 1. 关闭PeerConnection
+      // 1. 关闭PeerConnection (但保护自己的屏幕共享)
       const pc = peerConnections.value.get(leavingUserId);
       if (pc) {
         try {
-          // 停止所有发送器和接收器
-          const senders = pc.getSenders();
-          senders.forEach(sender => {
-            if (sender.track) {
-              sender.track.stop();
-              console.log('⏹️ 停止发送轨道:', sender.track.kind);
-            }
-          });
-
-          const receivers = pc.getReceivers();
-          receivers.forEach(receiver => {
-            if (receiver.track) {
-              receiver.track.stop();
-              console.log('⏹️ 停止接收轨道:', receiver.track.kind);
-            }
-          });
-
-          // 关闭连接
+          // 关闭连接，但不停止自己的轨道
           pc.close();
           peerConnections.value.delete(leavingUserId);
-          console.log('🔗 已完全关闭与用户的连接:', leavingUserId);
+          console.log('🔗 已关闭与用户的连接:', leavingUserId);
         } catch (error) {
           console.error('❌ 关闭连接时出错:', leavingUserId, error);
         }
       }
 
-      // 2. 清理DOM元素（使用简单的清理方式）
+      // 2. 精准清理离开用户的DOM元素（保护自己的媒体流）
       const remoteVideoContainer = document.getElementById('remote-videos');
       if (remoteVideoContainer) {
-        // 查找所有相关元素并移除
-        const elements = remoteVideoContainer.querySelectorAll(`[id^="video-${leavingUserId}"], [id^="audio-${leavingUserId}"], [id^="debug-${leavingUserId}"], [data-user="${leavingUserId}"]`);
+        // 只查找离开用户相关的元素
+        const elements = remoteVideoContainer.querySelectorAll(`[id^="video-${leavingUserId}"], [id^="audio-${leavingUserId}"], [id^="debug-${leavingUserId}"]`);
         elements.forEach(element => {
-          console.log('🗑️ 移除元素:', element.id || element.tagName);
+          console.log('🗑️ 移除离开用户的元素:', element.id || element.tagName);
 
-          // 如果是媒体元素，停止流
+          // 只清理离开用户的流，不影响自己的流
           if (element instanceof HTMLVideoElement || element instanceof HTMLAudioElement) {
             const stream = (element as HTMLVideoElement | HTMLAudioElement).srcObject as MediaStream;
             if (stream) {
-              stream.getTracks().forEach(track => {
-                try {
-                  track.stop();
-                  console.log('⏹️ 停止轨道:', track.kind);
-                } catch (error) {
-                  console.warn('⚠️ 停止轨道时出错:', error);
-                }
-              });
+              // 验证这个流确实是离开用户的，不是自己的流
+              const isLeavingUserStream = stream.getTracks().some(track =>
+                track.label && track.label.includes(leavingUserId)
+              ) || element.id.includes(leavingUserId);
+
+              if (isLeavingUserStream) {
+                stream.getTracks().forEach(track => {
+                  try {
+                    track.stop();
+                    console.log('⏹️ 停止离开用户的轨道:', track.kind);
+                  } catch (error) {
+                    console.warn('⚠️ 停止轨道时出错:', error);
+                  }
+                });
+              }
             }
             (element as HTMLVideoElement | HTMLAudioElement).srcObject = null;
           }
 
           element.remove();
         });
-
-        // 强制重绘
-        remoteVideoContainer.style.display = 'none';
-        remoteVideoContainer.offsetHeight; // 触发重排
-        setTimeout(() => {
-          remoteVideoContainer.style.display = 'flex';
-        }, 50);
       }
 
       // 3. 最后更新状态
       activeRemoteUsers.value.delete(leavingUserId);
       remoteStreams.value.delete(leavingUserId);
+
+      // 4. 确保自己的屏幕共享保持活跃
+      if (isScreenSharing.value && screenStream) {
+        console.log('🖥️ 确认屏幕共享状态:', {
+          isScreenSharing: isScreenSharing.value,
+          screenStreamActive: screenStream.getTracks().some(track => track.readyState === 'live'),
+          trackCount: screenStream.getTracks().length
+        });
+
+        // 重新验证所有剩余连接的屏幕共享状态
+        if (screenStream) {
+          peerConnections.value.forEach((pc, peerId) => {
+            const screenSenders = pc.getSenders().filter(sender =>
+              sender.track && sender.track.kind === 'video' &&
+              screenStream!.getTracks().includes(sender.track)
+            );
+            console.log(`🖥️ 用户 ${peerId} 的屏幕共享发送器数量: ${screenSenders.length}`);
+          });
+        }
+      }
 
       console.log('🎥 已完成用户离开清理:', leavingUserId);
       status.value = `${leavingUserId} 离开了房间`;
@@ -857,7 +865,7 @@ function createPeerConnectionForUser(peerId: string): RTCPeerConnection {
           videoElement.autoplay = true;
           videoElement.playsInline = true;
           videoElement.muted = false; // 确保不静音远程音频
-          videoElement.controls = true; // 添加控制按钮以便调试
+          videoElement.controls = false; // 不显示默认控制器
           videoElement.style.width = '45%';
           videoElement.style.border = isTauri ? '3px solid #ff6b6b' : '2px solid #007bff';
           videoElement.style.margin = '4px';
@@ -967,6 +975,7 @@ function createPeerConnectionForUser(peerId: string): RTCPeerConnection {
 
         // 设置视频源流
         videoElement.srcObject = stream;
+        videoElement.volume = globalVolume.value / 100; // 应用全局音量设置
         console.log(`📹 设置视频源流成功: ${peerId} 流 ${streamIndex}, 流ID:`, stream.id);
 
         // 在Tauri环境中强制重新加载视频
@@ -1021,7 +1030,7 @@ function createPeerConnectionForUser(peerId: string): RTCPeerConnection {
           audioElement.id = audioElementId;
           audioElement.autoplay = true;
           audioElement.muted = false; // 确保不静音远程音频
-          audioElement.controls = true; // 显示控制器以便用户调试
+          audioElement.controls = false; // 不显示默认控制器
           audioElement.style.width = '100%';
           audioElement.style.marginTop = '4px';
           audioElement.style.border = isTauri ? '2px solid #ff6b6b' : '1px solid #007bff';
@@ -1063,6 +1072,7 @@ function createPeerConnectionForUser(peerId: string): RTCPeerConnection {
 
         // 设置音频源并尝试播放
         audioElement.srcObject = stream;
+        audioElement.volume = globalVolume.value / 100; // 应用全局音量设置
 
         // 尝试播放音频，处理自动播放策略
         const playAudio = async () => {
@@ -1412,10 +1422,118 @@ function leave() {
 // ---------- 设备控制 ----------
 async function switchAudioDevice() {
   console.log('🎤 切换音频设备到:', selectedAudioInput.value);
+
+  if (!joined.value || !localStream) {
+    console.log('⚠️ 尚未加入房间或没有本地流，无法切换音频设备');
+    return;
+  }
+
+  try {
+    // 停止当前的音频轨道
+    const audioTracks = localStream.getAudioTracks();
+    audioTracks.forEach(track => track.stop());
+
+    // 获取新的媒体约束
+    const constraints = {
+      video: localStream.getVideoTracks().length > 0 ? true : false,
+      audio: selectedAudioInput.value ? { deviceId: { exact: selectedAudioInput.value } } : true
+    };
+
+    console.log('🎤 获取新的音频流，约束:', constraints);
+
+    // 获取新的媒体流
+    const newStream = await navigator.mediaDevices.getUserMedia(constraints);
+
+    // 替换音频轨道
+    const newAudioTracks = newStream.getAudioTracks();
+
+    // 更新本地流
+    localStream = newStream;
+
+    // 更新本地视频显示
+    if (localVideo.value) {
+      localVideo.value.srcObject = newStream;
+    }
+
+    // 更新所有PeerConnection中的音频轨道
+    peerConnections.value.forEach((pc, peerId) => {
+      try {
+        const senders = pc.getSenders();
+        const audioSenders = senders.filter(sender =>
+          sender.track && sender.track.kind === 'audio'
+        );
+
+        // 移除旧的音频发送器
+        audioSenders.forEach(sender => {
+          pc.removeTrack(sender);
+        });
+
+        // 添加新的音频轨道
+        newAudioTracks.forEach(track => {
+          pc.addTrack(track, newStream);
+        });
+
+        console.log(`✅ 已更新 ${peerId} 的音频轨道`);
+
+        // 触发重新协商
+        if (pc.signalingState === 'stable') {
+          renegotiateWithUser(peerId);
+        }
+      } catch (error) {
+        console.error(`❌ 更新 ${peerId} 音频轨道失败:`, error);
+      }
+    });
+
+    console.log('✅ 音频设备切换成功');
+    status.value = '音频设备切换成功';
+
+  } catch (error) {
+    console.error('❌ 音频设备切换失败:', error);
+    status.value = `音频设备切换失败: ${error}`;
+  }
 }
 
 async function switchAudioOutputDevice() {
   console.log('🔊 切换音频输出设备到:', selectedAudioOutput.value);
+
+  if (!selectedAudioOutput.value) {
+    console.log('⚠️ 未选择音频输出设备');
+    return;
+  }
+
+  try {
+    // 更新本地视频的音频输出
+    if (localVideo.value) {
+      await (localVideo.value as any).setSinkId(selectedAudioOutput.value);
+      console.log('✅ 本地视频音频输出已更新');
+    }
+
+    // 更新所有远程视频的音频输出
+    const remoteVideoContainer = document.getElementById('remote-videos');
+    if (remoteVideoContainer) {
+      const videos = remoteVideoContainer.querySelectorAll('video');
+      const audios = remoteVideoContainer.querySelectorAll('audio');
+
+      videos.forEach(video => {
+        (video as HTMLVideoElement).setSinkId(selectedAudioOutput.value)
+          .then(() => console.log('✅ 远程视频音频输出已更新'))
+          .catch(err => console.warn('⚠️ 远程视频音频输出更新失败:', err));
+      });
+
+      audios.forEach(audio => {
+        (audio as HTMLAudioElement).setSinkId(selectedAudioOutput.value)
+          .then(() => console.log('✅ 远程音频输出已更新'))
+          .catch(err => console.warn('⚠️ 远程音频输出更新失败:', err));
+      });
+    }
+
+    console.log('✅ 音频输出设备切换成功');
+    status.value = '音频输出设备切换成功';
+
+  } catch (error) {
+    console.error('❌ 音频输出设备切换失败:', error);
+    status.value = `音频输出设备切换失败: ${error}`;
+  }
 }
 
 function toggleAudio() {
@@ -1426,6 +1544,33 @@ function toggleAudio() {
     });
     audioEnabled.value = !audioEnabled.value;
   }
+}
+
+// 全局音量控制函数
+function updateGlobalVolume() {
+  console.log('🔊 更新全局音量到:', globalVolume.value + '%');
+
+  // 更新本地视频音量
+  if (localVideo.value) {
+    localVideo.value.volume = globalVolume.value / 100;
+  }
+
+  // 更新所有远程视频和音频元素的音量
+  const remoteVideoContainer = document.getElementById('remote-videos');
+  if (remoteVideoContainer) {
+    const videos = remoteVideoContainer.querySelectorAll('video');
+    const audios = remoteVideoContainer.querySelectorAll('audio');
+
+    videos.forEach(video => {
+      (video as HTMLVideoElement).volume = globalVolume.value / 100;
+    });
+
+    audios.forEach(audio => {
+      (audio as HTMLAudioElement).volume = globalVolume.value / 100;
+    });
+  }
+
+  console.log('✅ 全局音量更新完成');
 }
 
 function toggleVideo() {
@@ -2145,6 +2290,64 @@ onUnmounted(() => {
 
 .debug-btn:hover:not(:disabled) {
   background-color: #5a6268 !important;
+}
+
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background-color: #f8f9fa;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  margin: 0 5px;
+}
+
+.volume-control label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #333;
+}
+
+.volume-control input[type="range"] {
+  width: 100px;
+  height: 4px;
+  background: #ddd;
+  outline: none;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.volume-control input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  background: #007bff;
+  cursor: pointer;
+  border-radius: 50%;
+  border: 2px solid white;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+}
+
+.volume-control input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  background: #007bff;
+  cursor: pointer;
+  border-radius: 50%;
+  border: 2px solid white;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+}
+
+.volume-control span {
+  font-size: 12px;
+  font-weight: bold;
+  color: #007bff;
+  min-width: 35px;
+  text-align: center;
 }
 
 .video-container {
