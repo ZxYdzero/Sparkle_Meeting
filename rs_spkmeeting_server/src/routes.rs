@@ -48,9 +48,9 @@ pub async fn room_members(req: HttpRequest, path: web::Path<(String,)>, data: we
         }
     }
 
-    // 使用无锁的 DashMap 查询房间成员
+    // 使用完全无锁的 DashMap 查询房间成员
     if let Some(set) = data.rooms.get(room) {
-        let members: Vec<String> = set.iter().cloned().collect();
+        let members: Vec<String> = set.iter().map(|entry| entry.key().clone()).collect();
         tracing::info!("✅ Room '{}' has {} members: {:?}", room, members.len(), members);
 
         Ok(HttpResponse::Ok().json(serde_json::json!({

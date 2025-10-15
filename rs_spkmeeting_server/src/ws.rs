@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, debug, warn};
 use crate::state::AppState;
 use crate::ws_text::WsText;
+use dashmap::DashMap;
 
 /// 信令消息类型
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum SignalMessage {
-    Join { room: String, user: String },
-    Leave { room: String, user: String },
+    Join { room: String, user: String, session_id: Option<String> },
+    Leave { room: String, user: String, session_id: Option<String> },
     Offer { to: String, from: String, sdp: String },
     Answer { to: String, from: String, sdp: String },
     Ice { to: String, from: String, candidate: String },
@@ -20,6 +21,7 @@ pub enum SignalMessage {
 
 pub struct WsConn {
     pub id: Option<String>,
+    pub session_id: Option<String>,
     pub state: AppState,
 }
 
@@ -34,7 +36,7 @@ impl Actor for WsConn {
         if let Some(id) = &self.id {
             info!("👋 User '{}' disconnected from WebSocket", id);
 
-            // remove from peers (无锁操作)
+            // remove from peers
             let removed_peer = self.state.peers.remove(id);
             if removed_peer.is_some() {
                 debug!("🗑️  Removed user '{}' from peers registry", id);
@@ -42,30 +44,24 @@ impl Actor for WsConn {
 
             // remove from any rooms and collect rooms left (无锁操作)
             let mut left_rooms: Vec<String> = Vec::new();
-            // 需要检查所有房间，看用户是否在其中
-            let mut rooms_to_remove: Vec<String> = Vec::new();
-            for room_entry in self.state.rooms.iter() {
-                let room_name = room_entry.key().clone();
-                let mut should_remove_room = false;
+            // 先收集所有房间名
+            let room_names: Vec<String> = self.state.rooms.iter().map(|r| r.key().clone()).collect();
 
-                // 使用 entry API 来安全地修改房间成员
+            for room_name in room_names {
+                let mut should_remove_room = false;
+            
                 if let Some(mut members) = self.state.rooms.get_mut(&room_name) {
-                    if members.remove(id) {
+                    if members.remove(id).is_some() {
                         left_rooms.push(room_name.clone());
                         if members.is_empty() {
                             should_remove_room = true;
                         }
                     }
                 }
-
+            
                 if should_remove_room {
-                    rooms_to_remove.push(room_name);
+                    self.state.rooms.remove(&room_name);
                 }
-            }
-
-            // 删除空的房间
-            for room_name in rooms_to_remove {
-                self.state.rooms.remove(&room_name);
             }
 
             if !left_rooms.is_empty() {
@@ -79,7 +75,7 @@ impl Actor for WsConn {
                 // 获取房间内剩余的成员 (无锁操作)
                 let members_to_notify: Vec<String> = {
                     if let Some(members) = self.state.rooms.get(&room) {
-                        members.iter().cloned().collect()
+                        members.iter().map(|entry| entry.key().clone()).collect()
                     } else {
                         Vec::new()
                     }
@@ -136,21 +132,63 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsConn {
 }
 
 impl WsConn {
-    pub fn new(state: AppState) -> Self { Self { id: None, state } }
+    pub fn new(state: AppState) -> Self { Self { id: None, session_id: None, state } }
 
     fn handle_signal(&mut self, msg: SignalMessage, ctx: &mut ws::WebsocketContext<Self>) {
         match msg {
-            SignalMessage::Join { room, user } => {
-                info!("👤 User '{}' attempting to join room '{}'", user, room);
+            SignalMessage::Join { room, user, session_id } => {
+                info!("👤 User '{}' attempting to join room '{}' with session_id: {:?}", user, room, session_id);
+
+                // 记录连接尝试时间戳，用于调试房间锁定问题
+                let join_attempt_time = std::time::Instant::now();
 
                 self.id = Some(user.clone());
+                self.session_id = session_id.clone();
 
-                // add to room (无锁操作)
-                info!("🔓 Adding user '{}' to room '{}' (无锁操作)", user, room);
+                // 增强的重复连接检测 - 修复房间锁定问题
+                let user_already_in_room = {
+                    if let Some(members) = self.state.rooms.get(&room) {
+                        members.contains_key(&user)
+                    } else {
+                        false
+                    }
+                };
+
+                let user_has_active_connection = {
+                    if let Some(_) = self.state.peers.get(&user) {
+                        warn!("⚠️ User '{}' already has an active peer connection. This might be a room lock issue.", user);
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                // 如果用户已经在房间中或有活跃连接，需要清理
+                if user_already_in_room || user_has_active_connection {
+                    warn!("⚠️ ROOM LOCK ISSUE: User '{}' has existing state (in_room: {}, has_connection: {}). Cleaning up previous session first.",
+                          user, user_already_in_room, user_has_active_connection);
+
+                    // 强制清理用户之前的会话
+                    self.cleanup_user_session(&user, &room);
+
+                    // 添加延迟以确保清理完成
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    info!("✅ Previous session cleanup completed for user '{}', proceeding with join", user);
+
+                    // 强制清理房间内所有可能的问题连接
+                    self.cleanup_problematic_connections_in_room(&room, &user);
+                }
+
+                // 记录Join成功，用于调试
+                info!("🔐 Join processing took {}ms for user '{}' in room '{}'",
+                      join_attempt_time.elapsed().as_millis(), user, room);
+
+                // add to room (完全无锁操作)
+                info!("🔓 Adding user '{}' to room '{}' (完全无锁操作)", user, room);
                 let member_count = {
-                    let mut members = self.state.rooms.entry(room.clone()).or_insert_with(std::collections::HashSet::new);
+                    let members = self.state.rooms.entry(room.clone()).or_insert_with(DashMap::new);
                     let _was_empty = members.is_empty();
-                    members.insert(user.clone());
+                    members.insert(user.clone(), ());
                     info!("✅ User '{}' successfully joined room '{}'. Room now has {} members",
                                user, room, members.len());
                     members.len()
@@ -177,8 +215,8 @@ impl WsConn {
                     let members_to_notify: Vec<String> = {
                         if let Some(members) = self.state.rooms.get(&room) {
                             members.iter()
-                                .filter(|&member| member != &user)
-                                .cloned()
+                                .filter(|entry| entry.key() != &user)
+                                .map(|entry| entry.key().clone())
                                 .collect()
                         } else {
                             Vec::new()
@@ -215,12 +253,23 @@ impl WsConn {
                     info!("🏠 User '{}' is the first member in room '{}'", user, room);
                 }
             }
-            SignalMessage::Leave { room, user } => {
-                info!("👤 User '{}' leaving room '{}'", user, room);
+            SignalMessage::Leave { room, user, session_id } => {
+                info!("👤 User '{}' leaving room '{}' with session_id: {:?}", user, room, session_id);
 
-                // 从房间中移除用户 (无锁操作)
+                // 验证会话ID（如果提供的话）
+                if let Some(current_session_id) = &self.session_id {
+                    if let Some(provided_session_id) = &session_id {
+                        if current_session_id != provided_session_id {
+                            warn!("⚠️ Session ID mismatch for user '{}'. Current: {:}, Provided: {:?}",
+                                  user, current_session_id, provided_session_id);
+                            // 可以选择是否继续处理Leave消息
+                        }
+                    }
+                }
+
+                // 从房间中移除用户 (完全无锁操作)
                 let should_remove_room = {
-                    if let Some(mut members) = self.state.rooms.get_mut(&room) {
+                    if let Some(members) = self.state.rooms.get_mut(&room) {
                         let member_count_before = members.len();
                         members.remove(&user);
                         let member_count_after = members.len();
@@ -249,12 +298,12 @@ impl WsConn {
                     debug!("📝 User '{}' removed from peers registry", user);
                 }
 
-                // 通知房间内剩余成员 (无锁操作) - 排除离开的用户
+                // 通知房间内剩余成员 (完全无锁操作) - 排除离开的用户
                 let members_to_notify: Vec<String> = {
                     if let Some(members) = self.state.rooms.get(&room) {
                         members.iter()
-                            .filter(|&member| member != &user)  // 排除离开的用户
-                            .cloned()
+                            .filter(|entry| entry.key() != &user)  // 排除离开的用户
+                            .map(|entry| entry.key().clone())
                             .collect()
                     } else {
                         Vec::new()
@@ -317,6 +366,105 @@ impl WsConn {
             SignalMessage::TriggerOffer { .. } => {
                 warn!("⚠️  Received unexpected TriggerOffer message - this should only be sent from server to client");
             }
+        }
+    }
+}
+
+impl WsConn {
+    /// 清理用户之前的会话 - 修复房间锁定问题
+    fn cleanup_user_session(&mut self, user: &str, room: &str) {
+        info!("🧹 Cleaning up previous session for user '{}' in room '{}'", user, room);
+
+        // 从peers注册表中移除旧的连接
+        if let Some((_, old_addr)) = self.state.peers.remove(user) {
+            info!("🗑️ Removed old peer connection for user '{}'", user);
+
+            // 通知旧连接断开（如果还在连接的话）
+            let disconnect_msg = serde_json::json!({
+                "type": "session_conflict",
+                "user": user,
+                "room": room,
+                "message": "New connection detected, disconnecting old session"
+            }).to_string();
+
+            if let Err(e) = old_addr.try_send(WsText(disconnect_msg)) {
+                warn!("⚠️ Failed to notify old connection about session conflict: {}", e);
+            }
+        }
+
+        // 从房间中移除用户（如果需要的话）
+        if let Some(members) = self.state.rooms.get_mut(room) {
+            members.remove(user);
+            info!("🗑️ Removed user '{}' from room '{}' during cleanup", user, room);
+        }
+
+        info!("✅ Session cleanup completed for user '{}'", user);
+    }
+
+    /// 清理房间内所有有问题的连接 - 彻底解决房间锁定问题
+    fn cleanup_problematic_connections_in_room(&mut self, room: &str, joining_user: &str) {
+        info!("🔧 Cleaning up problematic connections in room '{}' for user '{}'", room, joining_user);
+
+        // 获取房间内的所有成员
+        let room_members: Vec<String> = {
+            if let Some(members) = self.state.rooms.get(room) {
+                members.iter().map(|entry| entry.key().clone()).collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        // 检查每个成员的连接状态
+        let mut problematic_users: Vec<String> = Vec::new();
+        for member in &room_members {
+            if let Some(addr) = self.state.peers.get(member) {
+                // 尝试发送ping消息来检查连接状态
+                let ping_msg = serde_json::json!({"type":"ping"}).to_string();
+                if let Err(e) = addr.try_send(WsText(ping_msg)) {
+                    warn!("⚠️ User '{}' in room '{}' has broken connection (cannot send ping): {}", member, room, e);
+                    problematic_users.push(member.clone());
+                }
+            } else {
+                warn!("⚠️ User '{}' in room '{}' has no peer registry entry", member, room);
+                problematic_users.push(member.clone());
+            }
+        }
+
+        // 清理有问题的用户
+        for problematic_user in &problematic_users {
+            warn!("🔧 Removing problematic user '{}' from room '{}'", problematic_user, room);
+
+            // 从peers中移除
+            self.state.peers.remove(problematic_user);
+
+            // 从房间中移除
+            if let Some(members) = self.state.rooms.get_mut(room) {
+                members.remove(problematic_user);
+            }
+
+            // 通知其他用户（如果还有的话）
+            let disconnect_msg = serde_json::json!({
+                "type": "user_disconnected",
+                "user": problematic_user,
+                "room": room,
+                "reason": "Connection problem, removed from room"
+            }).to_string();
+
+            for member in &room_members {
+                if member != problematic_user {
+                    if let Some(addr) = self.state.peers.get(member) {
+                        if let Err(e) = addr.try_send(WsText(disconnect_msg.clone())) {
+                            warn!("⚠️ Failed to notify user '{}' about disconnect: {}", member, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        if problematic_users.len() > 0 {
+            info!("🧹 Cleaned up {} problematic users from room '{}': {:?}", problematic_users.len(), room, problematic_users);
+        } else {
+            info!("✅ All connections in room '{}' appear to be healthy", room);
         }
     }
 }

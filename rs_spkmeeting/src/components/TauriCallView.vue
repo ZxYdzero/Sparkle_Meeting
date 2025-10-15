@@ -175,8 +175,9 @@ async function getServerConfig() {
 async function enumerateDevices() {
   try {
     console.log('🔍 正在获取媒体设备...');
-    const devices = await invoke('enumerate_media_devices');
-    mediaDevices.value = devices as Array<any>;
+    // 使用纯前端WebRTC API获取设备
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    mediaDevices.value = devices;
 
     // 分类设备
     audioInputDevices.value = mediaDevices.value.filter(d => d.kind === 'audioinput');
@@ -554,29 +555,27 @@ async function handleSignalRaw(text: string) {
       console.warn('⚠️ 当前所有连接:', Array.from(peerConnections.value.keys()));
     }
   } else if (msg.type === 'ice') {
-    const candidate = JSON.parse(msg.candidate);
     console.log('🧊 收到 ICE Candidate 来自:', msg.from);
     const pc = peerConnections.value.get(msg.from);
     if (pc) {
       try {
         console.log('🧊 开始处理 ICE Candidate');
-        console.log('🧊 Candidate 详情:', {
-          candidate: candidate.candidate,
-          sdpMid: candidate.sdpMid,
-          sdpMLineIndex: candidate.sdpMLineIndex,
-          foundation: candidate.foundation
-        });
+        console.log('🧊 Candidate 详情:', msg.candidate);
         console.log('📡 PeerConnection 当前状态:', pc.connectionState);
         console.log('🧊 ICE 连接状态:', pc.iceConnectionState);
 
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        await pc.addIceCandidate(new RTCIceCandidate({
+          candidate: msg.candidate,
+          sdpMid: '',
+          sdpMLineIndex: 0
+        }));
         console.log('✅ 添加 ICE Candidate 成功');
         console.log('🧊 ICE 连接状态更新:', pc.iceConnectionState);
       } catch (err) {
         console.error('❌ 添加 ICE Candidate 失败:', err);
         console.error('❌ ICE 错误详情:', {
           peerId: msg.from,
-          candidate: candidate,
+          candidate: msg.candidate,
           pcState: pc.connectionState,
           iceState: pc.iceConnectionState,
           hasRemoteDesc: !!pc.remoteDescription
@@ -1120,7 +1119,7 @@ function createPeerConnectionForUser(peerId: string): RTCPeerConnection {
         type: 'Ice',
         to: peerId,
         from: userId.value,
-        candidate: JSON.stringify(ev.candidate)
+        candidate: ev.candidate.candidate
       });
     } else {
       console.log('✅ ICE 收集完成');
