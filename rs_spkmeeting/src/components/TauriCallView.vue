@@ -6,6 +6,10 @@
         {{ joined ? `房间: ${room}` : 'Sparkle Meeting' }}
       </div>
       <div class="meeting-actions">
+        <router-link to="/settings" class="control-btn" title="设置">
+          ⚙️
+          <span class="tooltip">设置</span>
+        </router-link>
         <button @click="showLogs = !showLogs" class="control-btn" title="日志">
           📋
           <span class="tooltip">日志</span>
@@ -195,8 +199,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
-import './TauriCallView.css'
+import { ref, computed, nextTick, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
+import '../styles/call.css'
 
 /* ====================== 状态 ====================== */
 const room = ref('')
@@ -224,6 +228,44 @@ const showLogs = ref(false)
 
 const localVideo = ref<HTMLVideoElement | null>(null)
 const logContent = ref<HTMLDivElement | null>(null)
+
+/* ====================== 配置 ====================== */
+interface ServerConfig {
+  host: string
+  port: number
+}
+
+interface IceServerConfig {
+  urls: string[]
+  username?: string
+  credential?: string
+}
+
+interface AppConfig {
+  server: ServerConfig
+  ice_servers: IceServerConfig[]
+  default_volume: number
+}
+
+const config = ref<AppConfig>({
+  server: {
+    host: 'localhost',
+    port: 9090
+  },
+  ice_servers: [],
+  default_volume: 50
+})
+
+async function loadAppConfig() {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    const data = await invoke<AppConfig>('load_config')
+    config.value = data
+    addLog('info', `已加载配置: ${data.server.host}:${data.server.port}, ICE=${data.ice_servers.length}个`)
+  } catch (err) {
+    addLog('warning', `加载配置失败，使用默认值: ${(err as Error).message}`)
+  }
+}
 
 /* ====================== 日志函数 ====================== */
 function addLog(level: 'info' | 'success' | 'warning' | 'error', message: string) {
@@ -275,16 +317,27 @@ const remoteAudioElements = new Map<string, HTMLAudioElement>()
 const remoteVideoStreams = new Map<string, MediaStream>()
 
 /* ====================== 服务器 ====================== */
-const API_BASE = 'http://39.107.68.16:9090'
+const API_BASE = computed(() => {
+  // 从配置拼接 HTTP API 地址
+  const { host, port } = config.value.server
+  return `http://${host}:${port}`
+})
 const SIGNALING_PATH = '/api/ws'
-const ICE_SERVERS: RTCIceServer[] = []
+
+const ICE_SERVERS = computed(() => {
+  return config.value.ice_servers.map(s => ({
+    urls: s.urls,
+    username: s.username,
+    credential: s.credential
+  }))
+})
 
 /* ====================== 工具 ====================== */
 /* ====================== PeerConnection ====================== */
 
 // 创建 PeerConnection (统一处理发送和接收)
 function createPeerConnection() {
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS.value })
 
   // 先添加接收 transceiver（SFU 需要）
   pc.addTransceiver('audio', { direction: 'sendrecv' })
@@ -354,7 +407,7 @@ function createPeerConnection() {
   return pc
 }
 
-// 替换本地轨道（用于开关音视频或设备切换）
+// 替换本地轨道
 async function replaceTrack(kind: 'audio' | 'video', newTrack: MediaStreamTrack | null) {
   if (!pc) return
 
@@ -367,11 +420,11 @@ async function replaceTrack(kind: 'audio' | 'video', newTrack: MediaStreamTrack 
   }
 
   if (newTrack) {
-    // 替换轨道 - 不需要重新协商
+    // 替换轨道
     await sender.replaceTrack(newTrack)
     addLog('info', `替换 ${kind} 轨道`)
   } else {
-    // 移除轨道 - 需要重新协商
+    // 移除轨道
     pc.removeTrack(sender)
     addLog('info', `移除 ${kind} 轨道，开始重新协商`)
 
@@ -385,7 +438,7 @@ async function replaceTrack(kind: 'audio' | 'video', newTrack: MediaStreamTrack 
   }
 }
 
-// 刷新连接 (ICE Restart)
+// 刷新连接
 async function refreshConnection() {
   if (!pc) return
   addLog('info', '正在刷新连接 (ICE Restart)...')
@@ -410,6 +463,7 @@ function addRemoteVideo(id: string, stream: MediaStream, remoteUserId: string) {
   const video = document.createElement('video')
   video.autoplay = true
   video.playsInline = true
+  video.muted = true  // 静音视频元素，音频由单独的 audio 元素处理
   video.srcObject = stream
   // 确保视频播放
   video.onloadedmetadata = () => {
@@ -568,7 +622,7 @@ async function join() {
     addLog('info', '创建 PeerConnection')
 
     const wsUrl =
-      `ws://${API_BASE.replace(/^http?:\/\//, '')}` +
+      `ws://${API_BASE.value.replace(/^http?:\/\//, '')}` +
       `${SIGNALING_PATH}?room_id=${room.value}&name=${userName.value}`
 
     addLog('info', `连接 WebSocket: ${wsUrl}`)
@@ -640,8 +694,8 @@ async function createRoom() {
 
   try {
     // 调用后端 API 创建房间
-    addLog('info', `请求 ${API_BASE}/api/create`)
-    const response = await fetch(`${API_BASE}/api/create`, {
+    addLog('info', `请求 ${API_BASE.value}/api/create`)
+    const response = await fetch(`${API_BASE.value}/api/create`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
@@ -934,13 +988,24 @@ function leave() {
 }
 
 /* ====================== 生命周期 ====================== */
-onMounted(() => {
+onMounted(async () => {
   addLog('info', '组件已加载')
-  addLog('info', `服务器地址: ${API_BASE}`)
+  await loadAppConfig()
+  addLog('info', `服务器地址: ${API_BASE.value}`)
+})
+
+onActivated(async () => {
+  addLog('info', '返回会议页面')
+  // 重新加载配置
+  await loadAppConfig()
+})
+
+onDeactivated(() => {
+  addLog('info', '离开会议页面')
 })
 
 onUnmounted(() => {
-  addLog('info', '组件卸载')
+  addLog('info', '组件销毁')
   leave()
 })
 </script>

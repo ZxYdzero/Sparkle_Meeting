@@ -1,4 +1,3 @@
-mod network;
 mod config;
 
 use tauri::Manager;
@@ -8,13 +7,17 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
-            network::get_server_config,
             config::save_config,
             config::load_config,
             config::reset_config,
         ])
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
+
+            // 启动时自动创建默认配置文件
+            if let Err(e) = config::init_config(app.handle()) {
+                eprintln!("初始化配置失败: {}", e);
+            }
 
             #[cfg(debug_assertions)]
             {

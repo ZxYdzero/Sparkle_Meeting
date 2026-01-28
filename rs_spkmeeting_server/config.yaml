@@ -1,0 +1,8 @@
+# WebRTC SFU 配置文件
+
+# UDP 端口范围
+udp_port_min: 50000
+udp_port_max: 60000
+
+# 公网 IP (手动配置)
+public_ip: ""
